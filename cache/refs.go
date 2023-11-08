@@ -1016,9 +1016,11 @@ func (sr *immutableRef) Extract(ctx context.Context, s session.Group) (rerr erro
 		}
 		return rerr
 	} else if sr.cm.Snapshotter.Name() == "squashoverlay" {
-		if err := sr.prepareRemoteSnapshotsWrappedOverlayMode(ctx, s); err != nil {
-			return err
+		if rerr := sr.prepareRemoteSnapshotsWrappedOverlayMode(ctx, s); rerr != nil {
+			return rerr
 		}
+		rerr = sr.unlazy(ctx, sr.descHandlers, sr.progress, s, true, false)
+		return rerr
 	}
 
 	return sr.unlazy(ctx, sr.descHandlers, sr.progress, s, true, false)
@@ -1066,7 +1068,7 @@ func (sr *immutableRef) withRemoteSnapshotLabelsStargzMode(ctx context.Context, 
 }
 
 func (sr *immutableRef) prepareRemoteSnapshotsWrappedOverlayMode(ctx context.Context, s session.Group) error {
-	_, err := g.Do(ctx, sr.ID()+"-prepare-remote-snapshot", func(ctx context.Context) (_ struct{}, rerr error) {
+	_, err := g.Do(ctx, sr.ID()+"-prepare-wrappedoverlay-snapshot", func(ctx context.Context) (_ struct{}, rerr error) {
 		dhs := sr.descHandlers
 		for _, r := range sr.layerChain() {
 			r := r
@@ -1081,22 +1083,16 @@ func (sr *immutableRef) prepareRemoteSnapshotsWrappedOverlayMode(ctx context.Con
 				return struct{}{}, nil
 			}
 
-			// tmpLabels contains dh.SnapshotLabels + session IDs. All keys contain
-			// an unique ID for avoiding the collision among snapshotter API calls to
-			// this snapshot. tmpLabels will be removed at the end of this function.
 			defaultLabels := snapshots.FilterInheritedLabels(dh.SnapshotLabels)
 			if defaultLabels == nil {
 				defaultLabels = make(map[string]string)
 			}
-			tmpFields, tmpLabels := makeTmpLabelsStargzMode(defaultLabels, s)
 			defaultLabels["containerd.io/snapshot.ref"] = snapshotID
 
-			// Prepare remote snapshots
 			var (
 				key  = fmt.Sprintf("tmp-%s %s", identity.NewID(), r.getChainID())
 				opts = []snapshots.Opt{
 					snapshots.WithLabels(defaultLabels),
-					snapshots.WithLabels(tmpLabels),
 				}
 			)
 			parentID := ""
@@ -1105,33 +1101,7 @@ func (sr *immutableRef) prepareRemoteSnapshotsWrappedOverlayMode(ctx context.Con
 			}
 			if err := r.cm.Snapshotter.Prepare(ctx, key, parentID, opts...); err != nil {
 				if errdefs.IsAlreadyExists(err) {
-					// Check if the targeting snapshot ID has been prepared as
-					// a remote snapshot in the snapshotter.
-					info, err := r.cm.Snapshotter.Stat(ctx, snapshotID)
-					if err == nil { // usable as remote snapshot without unlazying.
-						defer func() {
-							// Remove tmp labels appended in this func
-							if info.Labels != nil {
-								for k := range tmpLabels {
-									info.Labels[k] = ""
-								}
-							} else {
-								// We are logging here to track to try to debug when and why labels are nil.
-								// Log can be removed when not happening anymore.
-								bklog.G(ctx).
-									WithField("snapshotID", snapshotID).
-									WithField("name", info.Name).
-									Debug("snapshots exist but labels are nil")
-							}
-							if _, err := r.cm.Snapshotter.Update(ctx, info, tmpFields...); err != nil {
-								bklog.G(ctx).Warn(errors.Wrapf(err,
-									"failed to remove tmp remote labels after prepare"))
-							}
-						}()
-
-						// Try the next layer as well.
-						continue
-					}
+					continue
 				}
 			}
 
@@ -1723,7 +1693,7 @@ func readonlyOverlay(opt []string) []string {
 
 func newSharableMountPool(tmpdirRoot string) (sharableMountPool, error) {
 	if tmpdirRoot != "" {
-		if err := os.MkdirAll(tmpdirRoot, 0700); err != nil {
+		if err := os.MkdirAll(tmpdirRoot, 0o700); err != nil {
 			return sharableMountPool{}, errors.Wrap(err, "failed to prepare mount pool")
 		}
 		// If tmpdirRoot is specified, remove existing mounts to avoid conflict.
