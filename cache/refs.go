@@ -1006,9 +1006,62 @@ func (sr *immutableRef) Extract(ctx context.Context, s session.Group) (rerr erro
 			return err
 		}
 		return rerr
+	} else if sr.cm.Snapshotter.Name() == "squashoverlay" {
+		if rerr := sr.prepareRemoteSnapshotsWrappedOverlayMode(ctx, s); rerr != nil {
+			return rerr
+		}
+		rerr = sr.unlazy(ctx, sr.descHandlers, sr.progress, s, true)
+		return rerr
 	}
 
 	return sr.unlazy(ctx, sr.descHandlers, sr.progress, s, true)
+}
+
+func (sr *immutableRef) prepareRemoteSnapshotsWrappedOverlayMode(ctx context.Context, s session.Group) error {
+	_, err := g.Do(ctx, sr.ID()+"-prepare-wrappedoverlay-snapshot", func(ctx context.Context) (_ struct{}, rerr error) {
+		dhs := sr.descHandlers
+		for _, r := range sr.layerChain() {
+			r := r
+			snapshotID := r.getSnapshotID()
+			if _, err := r.cm.Snapshotter.Stat(ctx, snapshotID); err == nil {
+				continue
+			}
+
+			dh := dhs[digest.Digest(r.getBlob())]
+			if dh == nil {
+				// We cannot prepare remote snapshots without descHandler.
+				return struct{}{}, nil
+			}
+
+			defaultLabels := snapshots.FilterInheritedLabels(dh.SnapshotLabels)
+			if defaultLabels == nil {
+				defaultLabels = make(map[string]string)
+			}
+			defaultLabels["containerd.io/snapshot.ref"] = snapshotID
+
+			var (
+				key  = fmt.Sprintf("tmp-%s %s", identity.NewID(), r.getChainID())
+				opts = []snapshots.Opt{
+					snapshots.WithLabels(defaultLabels),
+				}
+			)
+			parentID := ""
+			if r.layerParent != nil {
+				parentID = r.layerParent.getSnapshotID()
+			}
+			if err := r.cm.Snapshotter.Prepare(ctx, key, parentID, opts...); err != nil {
+				if errdefs.IsAlreadyExists(err) {
+					continue
+				}
+			}
+
+			// This layer and all upper layers cannot be prepared without unlazying.
+			break
+		}
+
+		return struct{}{}, nil
+	})
+	return err
 }
 
 func (sr *immutableRef) withRemoteSnapshotLabelsStargzMode(ctx context.Context, s session.Group, f func()) error {
